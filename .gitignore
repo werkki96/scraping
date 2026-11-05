@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# 수집 결과 (deals.json, before.json, -o로 지정한 파일 등)
+# 저장소에 넣을 JSON 설정 파일이 생기면 아래에 !파일명 으로 예외를 추가하세요.
+*.json
+*.jsonl
+*.csv
+*.xlsx
+~$*
+
+# 실행 중 생성되는 파일
+html_dump/
+seen_posts.json
+
+# 편집기·OS (VS Code 설정은 PC별 경로가 들어 있음)
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
