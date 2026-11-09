@@ -2,7 +2,7 @@
 퀘이사존 / 아카라이브 핫딜 목록 수집기 (Scrapling 0.5 기반)
 
 사용 예:
-    python hotdeal_scraper.py                         # 두 사이트, 최대 4페이지(3분 간격) → deals.json + deals.xlsx
+    python hotdeal_scraper.py                         # 두 사이트, 최대 4페이지(1분 간격) → deals.json + deals.xlsx
     python hotdeal_scraper.py --pages 1               # 1페이지만
     python hotdeal_scraper.py -o 핫딜.json            # → 핫딜.json + 핫딜.xlsx (이전 결과는 before.json)
     python hotdeal_scraper.py --excel 오늘핫딜.xlsx   # 엑셀 파일 이름만 바꾸기
@@ -20,11 +20,13 @@
 - 수집이 끝나면 deals.json을 새로 만들어 저장하고, 같은 이름의 엑셀(deals.xlsx)로 변환합니다.
 
 페이지 이동 규칙:
-- 사이트마다 1페이지부터 수집하고, 한 페이지를 처리한 뒤 --interval(기본 3분)만큼 기다렸다가 다음 페이지로 갑니다.
+- 사이트마다 1페이지부터 수집하고, 한 페이지를 처리한 뒤 --interval(기본 1분)만큼 기다렸다가 다음 페이지로 갑니다.
 - 어떤 페이지에 before.json에 있는 글(같은 글 번호 또는 같은 제목)이 나오면 그 사이트만 거기서 멈춥니다.
   before.json에 있는 글은 다시 저장하지 않습니다.
 - 제목은 같지만 before.json의 글보다 나중에 작성된 글(매주 올라오는 쿠폰 글 등)은 새 글로 저장하고 멈추지 않습니다.
 - 작성된 지 --max-age-hours(기본 24시간)가 지난 글이 나오면 그 사이트만 거기서 멈추고, 그 글은 저장하지 않습니다.
+- 월요일에는 --monday-days(기본 2)일 전 0시까지 넓혀서 주말 글도 수집합니다.
+  예: 3일 월요일이면 1일 토요일 0시 이후 글까지. 이때도 --pages(최대 페이지)는 넘지 않습니다.
 - 같은 실행 안에서 다음 페이지로 밀려 내려온 글은 중복 저장하지 않으며, 멈추는 조건으로 보지 않습니다.
 
 주의:
@@ -44,7 +46,7 @@ import logging
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -140,12 +142,25 @@ def posted_at(item: dict[str, Any]) -> datetime | None:
     return min(day_end, base - timedelta(hours=24))
 
 
-def is_too_old(item: dict[str, Any], max_age: timedelta | None) -> bool:
-    """수집 시각 기준으로 max_age 이상 지난 글이면 True. 작성 시각을 알 수 없으면 False."""
+def age_cutoff(now: datetime, max_age: timedelta | None, monday_days: int) -> datetime | None:
+    """이 시각 이전에 작성된 글은 수집하지 않는다. None이면 제한 없음.
+
+    기본은 now - max_age. 월요일이면 monday_days일 전 0시(예: 토요일 0시)까지 넓힌다.
+    """
     if max_age is None:
+        return None
+    cutoff = now - max_age
+    if now.weekday() == 0 and monday_days > 0:
+        cutoff = min(cutoff, datetime.combine(now.date() - timedelta(days=monday_days), time.min))
+    return cutoff
+
+
+def is_too_old(item: dict[str, Any], cutoff: datetime | None) -> bool:
+    """cutoff 시각 이전(같은 시각 포함)에 작성된 글이면 True. 작성 시각을 알 수 없으면 False."""
+    if cutoff is None:
         return False
     dt = posted_at(item)
-    return dt is not None and datetime.fromisoformat(item["collected_at"]) - dt >= max_age
+    return dt is not None and dt <= cutoff
 
 # ---------------------------------------------------------------------------
 # 사이트별 설정 — 셀렉터는 리스트 앞에서부터 차례로 시도하고, 처음 값이 나온 것을 씁니다.
@@ -313,7 +328,7 @@ class HotDealSpider(Spider):
     def __init__(self, sites: list[str], pages: int, keywords: list[str],
                  use_browser: bool, dump_dir: Path | None,
                  interval: float = 0.0, before: dict[str, Seen] | None = None,
-                 max_age: timedelta | None = None):
+                 cutoff: datetime | None = None):
         self.sites = sites
         self.pages = pages
         self.interval = interval            # 다음 페이지 요청 전 대기 시간(초)
@@ -321,7 +336,7 @@ class HotDealSpider(Spider):
         self.use_browser = use_browser
         self.dump_dir = dump_dir
         self.before = before or {}          # 이전 결과(before.json)의 글, 사이트 이름별
-        self.max_age = max_age              # 이보다 오래된 글이 나오면 그 사이트 중단 (None이면 제한 없음)
+        self.cutoff = cutoff                # 이 시각 이전에 쓴 글이 나오면 그 사이트 중단 (None이면 제한 없음)
         self.seen: set[tuple[str, str]] = set()
         super().__init__()
 
@@ -391,7 +406,7 @@ class HotDealSpider(Spider):
                 continue
             if match == "repost":           # 같은 제목이지만 새로 올라온 글: 멈추지 않고 새 글로 저장
                 reposts += 1
-            if is_too_old(item, self.max_age):
+            if is_too_old(item, self.cutoff):
                 too_old += 1
                 continue
             item["is_new"] = True
@@ -410,8 +425,8 @@ class HotDealSpider(Spider):
             self.logger.info(f"[{label} {page_no}페이지] 이전 결과에 있는 글이 나와 {label} 수집을 마칩니다.")
             return
         if too_old:
-            hours = self.max_age.total_seconds() / 3600
-            self.logger.info(f"[{label} {page_no}페이지] {hours:g}시간이 지난 글이 나와 {label} 수집을 마칩니다.")
+            since = self.cutoff.strftime("%m-%d %H:%M")
+            self.logger.info(f"[{label} {page_no}페이지] {since} 이전 글이 나와 {label} 수집을 마칩니다.")
             return
         if page_no >= self.pages or not items:
             return
@@ -441,10 +456,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--site", choices=list(SITES), action="append",
                     help="수집할 사이트 (여러 번 지정 가능, 기본: 전부)")
     ap.add_argument("--pages", type=int, default=4, help="사이트별 최대 목록 페이지 수 (기본 4)")
-    ap.add_argument("--interval", type=float, default=180,
-                    help="다음 페이지를 요청하기 전 대기 시간, 초 (기본 180 = 3분)")
+    ap.add_argument("--interval", type=float, default=60,
+                    help="다음 페이지를 요청하기 전 대기 시간, 초 (기본 60 = 1분)")
     ap.add_argument("--max-age-hours", type=float, default=24,
                     help="작성된 지 이 시간이 지난 글이 나오면 그 사이트 수집 중단 (기본 24, 0이면 제한 없음)")
+    ap.add_argument("--monday-days", type=int, default=2,
+                    help="월요일에는 이 일수 전 0시 이후 글까지 수집 (기본 2 = 토요일 0시부터, 0이면 끔)")
     ap.add_argument("--keyword", action="append", default=[], help="제목 키워드 필터 (OR 조건)")
     ap.add_argument("-o", "--output", default="deals.json",
                     help="결과 파일 (.json/.jsonl/.csv, 기본 deals.json). .xlsx를 주면 같은 이름의 .json과 .xlsx로 저장")
@@ -478,6 +495,11 @@ def main(argv: list[str] | None = None) -> int:
             counts = ", ".join(f"{site} {len(s.ids)}건" for site, s in before.items())
             print(f"{before_path}와 비교합니다: {counts}")
 
+    max_age = timedelta(hours=args.max_age_hours) if args.max_age_hours > 0 else None
+    cutoff = age_cutoff(datetime.now(), max_age, max(0, args.monday_days))
+    if cutoff is not None:
+        print(f"{cutoff:%Y-%m-%d %H:%M} 이후 글을 수집합니다.")
+
     spider = HotDealSpider(
         sites=args.site or list(SITES),
         pages=max(1, args.pages),
@@ -486,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         dump_dir=Path("html_dump") if args.dump_html else None,
         interval=max(0.0, args.interval),
         before=before,
-        max_age=timedelta(hours=args.max_age_hours) if args.max_age_hours > 0 else None,
+        cutoff=cutoff,
     )
     result = spider.start()
 
