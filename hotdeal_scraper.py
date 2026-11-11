@@ -2,7 +2,7 @@
 퀘이사존 / 아카라이브 핫딜 목록 수집기 (Scrapling 0.5 기반)
 
 사용 예:
-    python hotdeal_scraper.py                         # 두 사이트, 최대 4페이지(1분 간격) → deals.json + deals.xlsx
+    python hotdeal_scraper.py                         # 두 사이트, 최대 4페이지(1분 간격) → deals.json + 1109_핫딜.xlsx(오늘 날짜)
     python hotdeal_scraper.py --pages 1               # 1페이지만
     python hotdeal_scraper.py -o 핫딜.json            # → 핫딜.json + 핫딜.xlsx (이전 결과는 before.json)
     python hotdeal_scraper.py --excel 오늘핫딜.xlsx   # 엑셀 파일 이름만 바꾸기
@@ -16,8 +16,11 @@
     scrapling install        # --browser 옵션을 쓸 때만 필요
 
 파일 처리:
-- 시작할 때 결과 파일(기본 deals.json)이 있으면 before.json으로 이름을 바꿉니다. before.json이 이미 있으면 덮어씁니다.
-- 수집이 끝나면 deals.json을 새로 만들어 저장하고, 같은 이름의 엑셀(deals.xlsx)로 변환합니다.
+- 시작할 때 결과 파일(기본 deals.json)이 있으면 before.json으로 이름을 바꿉니다.
+  before.json이 이미 있으면 덮어쓰기 전에 그 내용을 history.json에 추가합니다(같은 사이트·글 번호는 한 번만).
+- 수집이 끝나면 deals.json을 새로 만들어 저장하고, 엑셀로 변환합니다.
+  -o를 주지 않으면 엑셀 이름은 '월일_핫딜.xlsx'(예: 1109_핫딜.xlsx)이고, 그날 여러 번 실행한 결과를 모두 담습니다.
+  -o를 주면 예전처럼 결과 파일과 같은 이름의 .xlsx에 이번 실행 결과만 담습니다.
 
 페이지 이동 규칙:
 - 사이트마다 1페이지부터 수집하고, 한 페이지를 처리한 뒤 --interval(기본 1분)만큼 기다렸다가 다음 페이지로 갑니다.
@@ -81,21 +84,50 @@ def is_newer(new_id: str, new_dt: datetime | None, old_id: str, old_dt: datetime
     return new_id.isdigit() and old_id.isdigit() and int(new_id) > int(old_id)
 
 
-def load_before(path: Path) -> dict[str, Seen]:
-    """이전 결과 파일(.json/.jsonl/.csv)을 읽어 사이트 이름(퀘이사존/아카라이브)별로 정리. 없으면 빈 값."""
+def read_items(path: Path) -> list[dict[str, Any]]:
+    """결과 파일(.json/.jsonl/.csv)의 글 목록. 파일이 없으면 빈 목록."""
     if not path.exists():
-        return {}
+        return []
     text = path.read_text(encoding="utf-8-sig")
     ext = path.suffix.lower()
     if ext == ".csv":
-        items = list(csv.DictReader(text.splitlines()))
-    elif ext == ".jsonl":
-        items = [json.loads(line) for line in text.splitlines() if line.strip()]
-    else:
-        items = json.loads(text) if text.strip() else []
+        return list(csv.DictReader(text.splitlines()))
+    if ext == ".jsonl":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    return json.loads(text) if text.strip() else []
 
+
+def item_key(item: dict[str, Any]) -> tuple[str, str]:
+    return str(item.get("site", "")), str(item.get("post_id") or "")
+
+
+def merge_items(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """같은 (사이트, 글 번호)는 하나만 남긴다. 순서는 처음 나온 자리, 내용은 나중 것(최신 값)."""
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for group in groups:
+        for it in group:
+            merged[item_key(it)] = it
+    return list(merged.values())
+
+
+def append_history(src: Path, history: Path) -> int:
+    """src의 글을 history(JSON)에 추가. 이미 있는 글은 최신 값으로 바꾸고, 새로 추가된 건수를 반환."""
+    items = read_items(src)
+    if not items:
+        return 0
+    old = read_items(history)
+    known = {item_key(it) for it in old}
+    added = len({item_key(it) for it in items} - known)
+    tmp = history.with_name(history.name + ".tmp")     # 쓰다가 끊겨도 기존 history가 깨지지 않도록
+    tmp.write_text(json.dumps(merge_items(old, items), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(history)
+    return added
+
+
+def load_before(path: Path) -> dict[str, Seen]:
+    """이전 결과 파일(.json/.jsonl/.csv)을 읽어 사이트 이름(퀘이사존/아카라이브)별로 정리. 없으면 빈 값."""
     before: dict[str, Seen] = {}
-    for it in items:
+    for it in read_items(path):
         seen = before.setdefault(str(it.get("site", "")), Seen())
         post_id = str(it.get("post_id") or "")
         if post_id:
@@ -463,32 +495,47 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--monday-days", type=int, default=2,
                     help="월요일에는 이 일수 전 0시 이후 글까지 수집 (기본 2 = 토요일 0시부터, 0이면 끔)")
     ap.add_argument("--keyword", action="append", default=[], help="제목 키워드 필터 (OR 조건)")
-    ap.add_argument("-o", "--output", default="deals.json",
+    ap.add_argument("-o", "--output",
                     help="결과 파일 (.json/.jsonl/.csv, 기본 deals.json). .xlsx를 주면 같은 이름의 .json과 .xlsx로 저장")
     ap.add_argument("--before", help="이전 결과를 옮겨 둘 파일 (기본 before + 결과 파일 확장자, 예: before.json)")
+    ap.add_argument("--history", help="지난 결과를 계속 모아 두는 파일 (기본 결과 파일 폴더의 history.json)")
     ap.add_argument("--no-before", action="store_true",
                     help="이전 결과를 옮기지도 비교하지도 않음 (결과 파일은 덮어씀)")
-    ap.add_argument("--excel", help="엑셀 파일 (기본: 결과 파일과 같은 이름의 .xlsx)")
+    ap.add_argument("--excel", help="엑셀 파일 (기본: 월일_핫딜.xlsx, -o를 주면 결과 파일과 같은 이름의 .xlsx)")
     ap.add_argument("--no-excel", action="store_true", help="엑셀로 변환하지 않음")
     ap.add_argument("--browser", action="store_true", help="브라우저 렌더링 사용 (scrapling install 필요)")
     ap.add_argument("--dump-html", action="store_true", help="각 사이트 1페이지 HTML을 ./html_dump 에 저장")
     args = ap.parse_args(argv)
 
-    out = Path(args.output)
+    now = datetime.now()
+    out = Path(args.output or "deals.json")
     excel = Path(args.excel) if args.excel else None
     if out.suffix.lower() == ".xlsx":       # 이전 사용법(-o deals.xlsx) 호환
         excel = excel or out
         out = out.with_suffix(".json")
+    daily = excel is None and not args.output   # 날짜 이름 엑셀에 그날 결과를 모두 모음
     if excel is None:
-        excel = out.with_suffix(".xlsx")
+        excel = out.with_name(f"{now:%m%d}_핫딜.xlsx") if daily else out.with_suffix(".xlsx")
     before_path = Path(args.before) if args.before else out.with_name("before" + out.suffix)
+    history_path = Path(args.history) if args.history else out.with_name("history.json")
+    if history_path.resolve() in (out.resolve(), before_path.resolve()):
+        ap.error("--history 파일은 결과 파일·before 파일과 이름이 달라야 합니다.")
+
+    def save_history(src: Path) -> None:
+        added = append_history(src, history_path)
+        print(f"{src} → {history_path}에 {added}건 추가")
 
     before: dict[str, Seen] = {}
-    if not args.no_before:
+    if args.no_before:
+        if out.exists():                    # 결과 파일을 덮어쓰기 전에 기록으로 남김
+            save_history(out)
+    else:
         if out.resolve() == before_path.resolve():
             ap.error("--before 파일은 결과 파일과 이름이 달라야 합니다.")
         if out.exists():
-            out.replace(before_path)        # before 파일이 이미 있으면 덮어씀
+            if before_path.exists():        # before 파일을 덮어쓰기 전에 기록으로 남김
+                save_history(before_path)
+            out.replace(before_path)
             print(f"이전 결과 {out} → {before_path}")
         before = load_before(before_path)
         if before:
@@ -496,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{before_path}와 비교합니다: {counts}")
 
     max_age = timedelta(hours=args.max_age_hours) if args.max_age_hours > 0 else None
-    cutoff = age_cutoff(datetime.now(), max_age, max(0, args.monday_days))
+    cutoff = age_cutoff(now, max_age, max(0, args.monday_days))
     if cutoff is not None:
         print(f"{cutoff:%Y-%m-%d %H:%M} 이후 글을 수집합니다.")
 
@@ -524,13 +571,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(result.items)}건 저장 → {out.resolve()}")
 
     if not args.no_excel:
+        rows = list(result.items)
+        if daily:                           # 오늘 앞서 실행한 결과(history, before)도 함께
+            today = now.date().isoformat()
+            olds = read_items(history_path) + ([] if args.no_before else read_items(before_path))
+            rows = [it for it in merge_items(olds, rows) if str(it.get("collected_at", ""))[:10] == today]
         try:
-            write_xlsx(list(result.items), excel)
+            write_xlsx(rows, excel)
         except PermissionError:
-            print(f"엑셀 저장 실패: {excel}이(가) 열려 있습니다. 닫은 뒤 "
-                  f"'python export_excel.py {out} -o {excel}'로 변환하세요.")
+            if daily:
+                print(f"엑셀 저장 실패: {excel}이(가) 열려 있습니다. 닫은 뒤 다시 실행하면 오늘 결과를 모두 담아 다시 만듭니다.")
+            else:
+                print(f"엑셀 저장 실패: {excel}이(가) 열려 있습니다. 닫은 뒤 "
+                      f"'python export_excel.py {out} -o {excel}'로 변환하세요.")
             return 1
-        print(f"엑셀 변환 → {excel.resolve()}")
+        print(f"엑셀 변환 ({len(rows)}건) → {excel.resolve()}")
     return 0
 
 
